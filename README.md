@@ -17,9 +17,16 @@ flash. Set `MQ2_CONNECTED 1` only after the MQ-2 voltage divider is wired.
 
 ## API
 - `POST /api/sensors` — ESP32 reading `{temperature, humidity, flame1, flame2, smoke}` (null = unavailable)
+  plus suppression state `{pump_on, servo_angle, fire_position, mode, device_id}`.
+  Replies `{"risk": "FIRE", "command": {"servo_angle": 135, "pump": true}}`; the ESP32 obeys it,
+  and decides by itself if the backend is silent for 3 s.
+- `POST /api/suppression {"action": "spray" | "block" | "auto"}` — dashboard override (spray 10 s / block 60 s).
+  No auth: anyone on the same Wi-Fi can call it.
 - `GET  /api/sensors/latest`
 - `GET  /api/sensors/history?limit=60` (max 600, in memory)
 - `GET  /api/status` — mode, overall status, alerts, health
 - `POST /api/demo {"enabled": true}` — simulated data; any real ESP32 POST turns it off
 
 Thresholds (temperature, rapid rise, MQ-2 raw) are constants at the top of `backend/main.py`.
+Spray rules (flame confirm count, hold time, nozzle angles) are at the top of `backend/fire_control.py`;
+the angles must match `ANGLE_*` in the sketch.

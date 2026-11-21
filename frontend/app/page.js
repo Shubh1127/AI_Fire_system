@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Panel, SensorLine, FlameTimeline, fireBands, fmtTime, COLORS } from './Charts';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-const CLIENT_MAX = 600; // client-side cap, matches backend history (~10 min)
+const CLIENT_MAX = 1200; // client-side cap, matches backend history (~10 min)
 const RANGES = [{ label: '30 sec', s: 30 }, { label: '1 min', s: 60 }, { label: '5 min', s: 300 }];
 
 const getJSON = (path) => fetch(API + path, { cache: 'no-store' }).then((r) => {
@@ -188,6 +188,8 @@ export default function Dashboard() {
             text={demo ? 'Demo (simulated)' : lastSeen == null ? 'Never connected' : status.online ? `Last seen ${lastSeen}s ago` : `Offline · ${lastSeen}s ago`} />
           <Health name="DHT11" ok={latest ? latest.temperature != null : null} text={latest ? (latest.temperature != null ? 'Reading' : 'Data unavailable') : '—'} />
           <Health name="Flame sensors" ok={latest ? true : null} text={latest ? 'Reporting' : '—'} />
+          <Health name="Suppression" ok={latest?.pump_on == null ? null : latest.mode === 'backend'}
+            text={latest?.pump_on == null ? 'No data (old firmware?)' : latest.mode === 'backend' ? 'Controlled by backend' : 'ESP32 local mode'} />
           <Health name="MQ-2" ok={latest?.smoke != null ? true : null} text={latest?.smoke != null ? 'Reading' : 'Not connected'} />
           <Health name="Buffered readings" ok={null} text={`${history.length} / ${CLIENT_MAX}`} />
         </ul>
@@ -238,13 +240,16 @@ export default function Dashboard() {
         {history.length === 0 ? <p className="muted pad">No live sensor data available</p> : (
           <div className="table-scroll">
             <table>
-              <thead><tr><th>Time</th><th>Temp (°C)</th><th>Humidity (%)</th><th>Flame 1</th><th>Flame 2</th><th>MQ-2 raw</th><th>Source</th></tr></thead>
+              <thead><tr><th>Time</th><th>Temp (°C)</th><th>Humidity (%)</th><th>Flame 1</th><th>Flame 2</th><th>MQ-2 raw</th><th>Fire at</th><th>Pump</th><th>Nozzle</th><th>Source</th></tr></thead>
               <tbody>
                 {history.slice(-10).reverse().map((p) => (
                   <tr key={p.t} className={p.flame1 === 0 || p.flame2 === 0 ? 'row-fire' : ''}>
                     <td>{fmtTime(p.t)}</td><td>{fmt(p.temperature)}</td><td>{fmt(p.humidity)}</td>
                     <td>{p.flame1 === 0 ? '0 🔥' : '1'}</td><td>{p.flame2 === 0 ? '0 🔥' : '1'}</td>
-                    <td>{p.smoke ?? 'N/C'}</td><td>{p.source === 'demo' ? 'DEMO' : 'ESP32'}</td>
+                    <td>{p.smoke ?? 'N/C'}</td>
+                    <td>{!p.fire_position || p.fire_position === 'none' ? '—' : p.fire_position}</td>
+                    <td>{p.pump_on == null ? '—' : p.pump_on ? 'ON 💧' : 'off'}</td>
+                    <td>{p.servo_angle == null ? '—' : `${p.servo_angle}°`}</td><td>{p.source === 'demo' ? 'DEMO' : 'ESP32'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -277,9 +282,9 @@ export default function Dashboard() {
         <ol className="arch">
           {[
             ['Sensors', 'DHT11 · Flame ×2 · MQ-2'],
-            ['ESP32', 'Reads every 1 s'],
+            ['ESP32', 'Reads every 0.5 s · aims nozzle · runs pump'],
             ['WiFi · HTTP POST', 'JSON → /api/sensors'],
-            ['FastAPI backend', 'Validation · alerts · history'],
+            ['FastAPI backend', 'Alerts · history · spray decision'],
             ['Next.js dashboard', 'Polls every 1 s'],
           ].map(([t, s]) => <li key={t}><strong>{t}</strong><span className="muted small">{s}</span></li>)}
         </ol>
@@ -295,18 +300,66 @@ export default function Dashboard() {
             <li>Camera-based flame & smoke recognition</li>
           </ul>
         </section>
-        {/* ---------- Future Fire Suppression Module ---------- */}
-        <section className="panel future">
-          <header className="panel-head"><h3>Fire Suppression Module</h3><span className="pill pill-off small">PLANNED</span></header>
-          <ul className="muted">
-            <li>Relay-driven buzzer / siren</li>
-            <li>Water pump or sprinkler valve activation on confirmed fire</li>
-            <li>Manual override with operator confirmation</li>
-          </ul>
-          <button className="btn" disabled>Activate suppression (not installed)</button>
-        </section>
+        {/* ---------- Fire Suppression Module ---------- */}
+        <Suppression latest={latest} sup={status?.suppression} demo={demo} online={!!status?.online} />
       </section>
     </main>
+  );
+}
+
+const DIRECTION = (a) => (a == null ? '' : a > 100 ? 'left' : a < 80 ? 'right' : 'centre');
+
+function Suppression({ latest, sup, demo, online }) {
+  const [busy, setBusy] = useState(false);
+  const hasData = latest?.pump_on != null;
+  const ov = sup?.override ?? { mode: null, seconds_left: 0 };
+  const pumpOn = !!latest?.pump_on;
+
+  async function send(action) {
+    setBusy(true);
+    try {
+      await fetch(`${API}/api/suppression`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+    } finally { setBusy(false); }
+  }
+
+  const disabled = busy || demo || !online;
+  return (
+    <section className="panel">
+      <header className="panel-head">
+        <h3>Fire Suppression Module</h3>
+        <span className={`pill small ${!hasData ? 'pill-off' : pumpOn ? 'pill-warn' : 'pill-ok'}`}>
+          {!hasData ? 'NO DATA' : pumpOn ? '💧 SPRAYING' : 'STANDBY'}
+        </span>
+      </header>
+      {!hasData ? (
+        <p className="muted pad">
+          {demo ? 'Not simulated in demo mode.' : 'Waiting for the suppression firmware (pump and servo status).'}
+        </p>
+      ) : (
+        <ul className="health">
+          <Health name="Water pump" ok={pumpOn ? false : true} text={pumpOn ? 'ON, spraying' : 'Off'} />
+          <Health name="Fire position" ok={latest.fire_position == null ? null : latest.fire_position === 'none'}
+            text={!latest.fire_position || latest.fire_position === 'none' ? 'No fire' : `🔥 ${latest.fire_position.toUpperCase()}`} />
+          {/* Not reported by the ESP32: same rule the firmware uses (flame seen or pump running) */}
+          <Health name="Red LED + buzzer" ok={!(pumpOn || latest.flame1 === 0 || latest.flame2 === 0)}
+            text={pumpOn || latest.flame1 === 0 || latest.flame2 === 0 ? 'Alarm on' : 'Off (green LED on)'} />
+          <Health name="Nozzle" ok={null} text={`${latest.servo_angle}° (${DIRECTION(latest.servo_angle)})`} />
+          <Health name="Control" ok={latest.mode === 'backend'}
+            text={latest.mode === 'backend' ? 'Backend decides' : 'ESP32 deciding locally (backend not answering)'} />
+          <Health name="Operator override" ok={ov.mode ? false : null}
+            text={ov.mode === 'spray' ? `Manual spray, ${ov.seconds_left}s left`
+              : ov.mode === 'block' ? `Spraying blocked, ${ov.seconds_left}s left` : 'None (automatic)'} />
+        </ul>
+      )}
+      <div className="pad" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn" disabled={disabled} onClick={() => send('spray')}>💧 Spray now (10 s)</button>
+        <button className="btn" disabled={disabled} onClick={() => send('block')}>✋ Block spraying (60 s)</button>
+        <button className="btn" disabled={disabled || !ov.mode} onClick={() => send('auto')}>↺ Back to automatic</button>
+      </div>
+    </section>
   );
 }
 

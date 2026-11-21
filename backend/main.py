@@ -9,14 +9,16 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import fire_control
+
 # Tuning knobs - adjust to your room and sensors.
-HISTORY_MAX = 600          # ~10 min at 1 reading/s
+HISTORY_MAX = 1200         # ~10 min at 2 readings/s (firmware SEND_INTERVAL = 500 ms)
 OFFLINE_AFTER_S = 5        # no reading for this long => ESP32 offline
 TEMP_WARN_C = 45.0
 TEMP_RISE_WARN_C = 3.0     # rise within TEMP_RISE_WINDOW_S => warning
@@ -25,7 +27,7 @@ SMOKE_WARN_RAW = 1500      # raw 12-bit ADC, NOT ppm - calibrate against clean a
 
 # ponytail: in-memory history, lost on restart; swap for SQLite/Postgres when persistence matters
 history = deque(maxlen=HISTORY_MAX)
-state = {"demo": False, "last_esp32": None, "history_version": 0}
+state = {"demo": False, "last_esp32": None, "history_version": 0, "command": None}
 
 
 class Reading(BaseModel):
@@ -34,14 +36,28 @@ class Reading(BaseModel):
     flame1: int = Field(..., ge=0, le=1)  # 1 = no flame, 0 = flame detected
     flame2: int = Field(..., ge=0, le=1)
     smoke: Optional[int] = Field(None, ge=0, le=4095)
+    # Sent by the suppression firmware; older firmware leaves these out
+    device_id: Optional[str] = None
+    flame1_ao: Optional[int] = Field(None, ge=0, le=4095)
+    flame2_ao: Optional[int] = Field(None, ge=0, le=4095)
+    pump_on: Optional[bool] = None
+    servo_angle: Optional[int] = Field(None, ge=0, le=180)
+    fire_position: Optional[Literal["none", "left", "right", "both"]] = None
+    mode: Optional[str] = None  # "backend" (obeying us) or "local" (ESP32 deciding alone)
 
 
 class DemoToggle(BaseModel):
     enabled: bool
 
 
+class SuppressionAction(BaseModel):
+    action: Literal["spray", "block", "auto"]
+
+
 def clear_history():
     history.clear()
+    fire_control.reset()
+    state["command"] = None
     state["history_version"] += 1
 
 
@@ -60,7 +76,8 @@ def compute_alerts(latest, now):
         return [{"level": "critical", "sensor": "ESP32", "message": "No live sensor data - ESP32 offline"}]
     for key, name in (("flame1", "Flame Sensor 1"), ("flame2", "Flame Sensor 2")):
         if latest[key] == 0:
-            alerts.append({"level": "critical", "sensor": name, "message": f"Flame detected by {name}"})
+            side = {"flame1": "left", "flame2": "right"}[key]
+            alerts.append({"level": "critical", "sensor": name, "message": f"Flame detected by {name} ({side} side)"})
     temp = latest["temperature"]
     if temp is None:
         alerts.append({"level": "warning", "sensor": "DHT11", "message": "DHT11 data unavailable - check wiring"})
@@ -71,6 +88,8 @@ def compute_alerts(latest, now):
         if past and temp - past[0]["temperature"] >= TEMP_RISE_WARN_C:
             alerts.append({"level": "warning", "sensor": "DHT11",
                            "message": f"Rapid temperature rise: +{temp - past[0]['temperature']:.1f} °C in {TEMP_RISE_WINDOW_S}s"})
+    if latest.get("pump_on"):
+        alerts.append({"level": "critical", "sensor": "Pump", "message": "Suppression active - water pump spraying"})
     if latest["smoke"] is not None and latest["smoke"] >= SMOKE_WARN_RAW:
         alerts.append({"level": "warning", "sensor": "MQ-2", "message": f"Smoke level high (raw {latest['smoke']})"})
     return alerts
@@ -123,7 +142,10 @@ def ingest(r: Reading):
         clear_history()
     state["last_esp32"] = time.time()
     add_reading(r, "esp32")
-    return {"ok": True}
+    result = fire_control.decide(r.model_dump())
+    state["command"] = result["command"]
+    # The ESP32 reads "command"; without it the ESP32 falls back to local mode
+    return {"ok": True, **result}
 
 
 @app.get("/api/sensors/latest")
@@ -160,7 +182,18 @@ def status():
         "alerts": alerts,
         "history_version": state["history_version"],
         "thresholds": {"temp_warn": TEMP_WARN_C, "smoke_warn": SMOKE_WARN_RAW},
+        "suppression": {
+            "command": state["command"],
+            "override": fire_control.override_status(),
+        },
     }
+
+
+@app.post("/api/suppression")
+def suppression(body: SuppressionAction):
+    """Dashboard override: spray now (10 s), block spraying (60 s), or back to auto."""
+    fire_control.set_override(body.action)
+    return fire_control.override_status()
 
 
 @app.post("/api/demo")
